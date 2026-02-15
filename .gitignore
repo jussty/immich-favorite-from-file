@@ -5,6 +5,7 @@ dist/
 build/
 .sha1cache.json
 .pixelcache.json
+.cache/
 *.jpg
 *.jpeg
 *.png

@@ -75,7 +75,13 @@ Favorited 614 assets (53 files had no match in Immich)
 
 ## Caching
 
-SHA-1 checksums are cached in a `.sha1cache.json` file inside the scanned folder. On subsequent runs, only new or modified files are re-hashed. The cache is keyed by file path, size, and modification time.
+The tool uses multiple caches to speed up subsequent runs:
+
+- **`.sha1cache.json`**: SHA-1 checksums of local files (keyed by path, size, and modification time)
+- **`.pixelcache.json`**: Pixel hashes of downloaded Immich assets (keyed by asset ID and checksum)
+- **`.cache/`**: Downloaded original assets from Stage 3 (enables instant reprocessing after dry-run)
+
+All caches are stored in the scanned folder and persist across runs.
 
 ## Limitations
 

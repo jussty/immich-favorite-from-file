@@ -25,6 +25,7 @@ from PIL import Image
 BATCH_SIZE = 1000
 CACHE_FILE = ".sha1cache.json"
 PIXEL_CACHE_FILE = ".pixelcache.json"
+ASSET_CACHE_DIR = ".cache"
 
 
 def sha1_file(path: Path) -> str:
@@ -305,11 +306,12 @@ def match_by_timezone_offset(
 
 def match_by_pixel_hash(
     server: str, api_key: str, files: list[Path],
-    pcache: dict[str, str],
+    pcache: dict[str, str], cache_dir: Path,
 ) -> tuple[list[tuple[str, Path]], list[Path]]:
     """Stage 3: Match by downloading originals and comparing pixel data.
 
     Uses pcache to avoid re-downloading assets seen in previous runs.
+    Also caches downloaded assets to disk in cache_dir for fast reprocessing.
     Tries timezone offsets to minimize candidate downloads.
     Returns (matches, unmatched_files).
     """
@@ -317,6 +319,9 @@ def match_by_pixel_hash(
     unmatched = []
     common_offsets = [0, -1, 1, -2, 2, -3, 3, -4, 4, -5, 5, -6, 6, -7, 7, -8, 8,
                       -9, 9, -10, 10, -11, 11, -12, 12, 13, 14]
+
+    # Ensure cache directory exists
+    cache_dir.mkdir(exist_ok=True)
 
     for i, path in enumerate(files, 1):
         dt = exif_datetime(path)
@@ -348,19 +353,30 @@ def match_by_pixel_hash(
 
             # Download and compare pixel hashes for candidates at this offset
             for candidate in candidates:
-                cache_key = f"{candidate['id']}|{candidate.get('checksum', '')}"
+                asset_id = candidate['id']
+                cache_key = f"{asset_id}|{candidate.get('checksum', '')}"
+
+                # Check if we already have the pixel hash
                 if cache_key in pcache:
                     remote_phash = pcache[cache_key]
                 else:
-                    original = api_download(
-                        server, api_key, f"/assets/{candidate['id']}/original"
-                    )
+                    # Check if asset is cached on disk
+                    cached_asset = cache_dir / asset_id
+                    if cached_asset.exists():
+                        original = cached_asset.read_bytes()
+                    else:
+                        # Download and cache
+                        original = api_download(
+                            server, api_key, f"/assets/{asset_id}/original"
+                        )
+                        cached_asset.write_bytes(original)
+
                     remote_phash = pixel_hash(original)
                     if remote_phash:
                         pcache[cache_key] = remote_phash
 
                 if remote_phash == local_phash:
-                    matches.append((candidate["id"], path))
+                    matches.append((asset_id, path))
                     found = True
                     break
 
@@ -495,8 +511,9 @@ def main():
     if remaining:
         print("Stage 3: Matching by pixel data (downloading originals)...", file=sys.stderr)
         pcache = load_pixel_cache(args.folder)
+        cache_dir = args.folder / ASSET_CACHE_DIR
         matches, remaining = match_by_pixel_hash(
-            args.server, args.api_key, remaining, pcache
+            args.server, args.api_key, remaining, pcache, cache_dir
         )
         save_pixel_cache(args.folder, pcache)
         all_matches.extend(matches)
