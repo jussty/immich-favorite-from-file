@@ -23,6 +23,7 @@ from PIL import Image
 
 BATCH_SIZE = 1000
 CACHE_FILE = ".sha1cache.json"
+PIXEL_CACHE_FILE = ".pixelcache.json"
 
 
 def sha1_file(path: Path) -> str:
@@ -90,6 +91,23 @@ def load_cache(folder: Path) -> dict[str, str]:
 def save_cache(folder: Path, cache: dict[str, str]) -> None:
     """Save hash cache to folder."""
     cache_path = folder / CACHE_FILE
+    cache_path.write_text(json.dumps(cache))
+
+
+def load_pixel_cache(folder: Path) -> dict[str, str]:
+    """Load pixel hash cache. Returns {asset_id|checksum: pixel_hash}."""
+    cache_path = folder / PIXEL_CACHE_FILE
+    if cache_path.exists():
+        try:
+            return json.loads(cache_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}
+
+
+def save_pixel_cache(folder: Path, cache: dict[str, str]) -> None:
+    """Save pixel hash cache."""
+    cache_path = folder / PIXEL_CACHE_FILE
     cache_path.write_text(json.dumps(cache))
 
 
@@ -214,10 +232,12 @@ def match_by_exif(
 
 
 def match_by_pixel_hash(
-    server: str, api_key: str, files: list[Path]
+    server: str, api_key: str, files: list[Path],
+    pcache: dict[str, str],
 ) -> tuple[list[tuple[str, Path]], list[Path]]:
     """Stage 3: Match by downloading originals and comparing pixel data.
 
+    Uses pcache to avoid re-downloading assets seen in previous runs.
     Returns (matches, unmatched_files).
     """
     matches = []
@@ -234,7 +254,7 @@ def match_by_pixel_hash(
 
         local_phash = pixel_hash(path)
 
-        # Search candidates by date (wider window for safety)
+        # Search candidates by date
         result = api_request(server, api_key, "POST", "/search/metadata", {
             "takenAfter": dt + ".000Z",
             "takenBefore": dt + ".999Z",
@@ -243,10 +263,17 @@ def match_by_pixel_hash(
 
         found = False
         for candidate in candidates:
-            original = api_download(
-                server, api_key, f"/assets/{candidate['id']}/original"
-            )
-            if pixel_hash(original) == local_phash:
+            cache_key = f"{candidate['id']}|{candidate.get('checksum', '')}"
+            if cache_key in pcache:
+                remote_phash = pcache[cache_key]
+            else:
+                original = api_download(
+                    server, api_key, f"/assets/{candidate['id']}/original"
+                )
+                remote_phash = pixel_hash(original)
+                pcache[cache_key] = remote_phash
+
+            if remote_phash == local_phash:
                 matches.append((candidate["id"], path))
                 found = True
                 break
@@ -352,7 +379,11 @@ def main():
     # 5. Stage 3: Pixel hash comparison
     if remaining:
         print("Stage 3: Matching by pixel data (downloading originals)...", file=sys.stderr)
-        matches, remaining = match_by_pixel_hash(args.server, args.api_key, remaining)
+        pcache = load_pixel_cache(args.folder)
+        matches, remaining = match_by_pixel_hash(
+            args.server, args.api_key, remaining, pcache
+        )
+        save_pixel_cache(args.folder, pcache)
         all_matches.extend(matches)
         print(f"  Matched {len(matches)}, remaining {len(remaining)}", file=sys.stderr)
 
@@ -372,6 +403,11 @@ def main():
     count = set_favorites(args.server, args.api_key, asset_ids, args.dry_run)
 
     # 7. Summary
+    if remaining:
+        print(f"\nUnmatched files ({len(remaining)}):", file=sys.stderr)
+        for path in remaining:
+            print(f"  {path.name}", file=sys.stderr)
+
     print(f"\n{'Would favorite' if args.dry_run else 'Favorited'} {count} assets"
           f" ({len(remaining)} files had no match in Immich)")
 

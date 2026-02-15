@@ -4,6 +4,7 @@ __pycache__/
 dist/
 build/
 .sha1cache.json
+.pixelcache.json
 *.jpg
 *.jpeg
 *.png
