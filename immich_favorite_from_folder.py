@@ -207,12 +207,11 @@ def match_by_exif(
             unmatched.append(path)
             continue
 
-        # Search ±14h to handle timezone differences (EXIF has no tz info)
-        after = (dt - timedelta(hours=14)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-        before = (dt + timedelta(hours=14)).strftime("%Y-%m-%dT%H:%M:%S.999Z")
+        # Search 1-second window (assume no timezone offset)
+        dt_str = dt.strftime("%Y-%m-%dT%H:%M:%S")
         result = api_request(server, api_key, "POST", "/search/metadata", {
-            "takenAfter": after,
-            "takenBefore": before,
+            "takenAfter": dt_str + ".000Z",
+            "takenBefore": dt_str + ".999Z",
         })
         candidates = result.get("assets", {}).get("items", [])
 
@@ -237,6 +236,68 @@ def match_by_exif(
             # Ambiguous — leave for pixel hash stage
             unmatched.append(path)
         else:
+            unmatched.append(path)
+
+    return matches, unmatched
+
+
+def match_by_timezone_offset(
+    server: str, api_key: str, files: list[Path]
+) -> tuple[list[tuple[str, Path]], list[Path]]:
+    """Stage 2.5: Try common timezone offsets for EXIF date mismatches.
+
+    Returns (matches, unmatched_files).
+    """
+    matches = []
+    unmatched = []
+    # Common timezone offsets: -12 to +14 hours
+    common_offsets = [-12, -11, -10, -9, -8, -7, -6, -5, -4, -3, -2, -1,
+                      1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+
+    for i, path in enumerate(files, 1):
+        dt = exif_datetime(path)
+        dims = image_dimensions(path)
+        if i % 50 == 0 or i == len(files):
+            print(f"    Searched {i}/{len(files)}...", file=sys.stderr)
+
+        if not dt:
+            unmatched.append(path)
+            continue
+
+        found = False
+        # Try each timezone offset
+        for offset in common_offsets:
+            dt_offset = dt + timedelta(hours=offset)
+            dt_str = dt_offset.strftime("%Y-%m-%dT%H:%M:%S")
+            result = api_request(server, api_key, "POST", "/search/metadata", {
+                "takenAfter": dt_str + ".000Z",
+                "takenBefore": dt_str + ".999Z",
+            })
+            candidates = result.get("assets", {}).get("items", [])
+
+            if not candidates:
+                continue
+
+            # Filter by dimensions
+            if dims:
+                w, h = dims
+                filtered = [
+                    c for c in candidates
+                    if (c.get("width") is None or c.get("height") is None)
+                    or (c.get("width") == w and c.get("height") == h)
+                ]
+                if filtered:
+                    candidates = filtered
+
+            if len(candidates) == 1:
+                matches.append((candidates[0]["id"], path))
+                found = True
+                break
+            elif len(candidates) > 1:
+                # Ambiguous - continue to next offset or give up
+                continue
+
+        if not found:
             unmatched.append(path)
 
     return matches, unmatched
@@ -339,6 +400,12 @@ def main():
         action="store_true",
         help="Show what would be done without making changes",
     )
+    parser.add_argument(
+        "--copy-unmatched",
+        type=Path,
+        metavar="DIR",
+        help="Copy unmatched files to this directory",
+    )
     args = parser.parse_args()
 
     if not args.server:
@@ -385,14 +452,21 @@ def main():
     all_matches.extend(matches)
     print(f"  Matched {len(matches)}, remaining {len(remaining)}", file=sys.stderr)
 
-    # 4. Stage 2: EXIF date + dimensions
+    # 4. Stage 2: EXIF date + dimensions (no timezone offset)
     if remaining:
         print("Stage 2: Matching by EXIF date + dimensions...", file=sys.stderr)
         matches, remaining = match_by_exif(args.server, args.api_key, remaining)
         all_matches.extend(matches)
         print(f"  Matched {len(matches)}, remaining {len(remaining)}", file=sys.stderr)
 
-    # 5. Stage 3: Pixel hash comparison
+    # 5. Stage 2.5: Timezone offset retry
+    if remaining:
+        print("Stage 2.5: Matching with timezone offsets...", file=sys.stderr)
+        matches, remaining = match_by_timezone_offset(args.server, args.api_key, remaining)
+        all_matches.extend(matches)
+        print(f"  Matched {len(matches)}, remaining {len(remaining)}", file=sys.stderr)
+
+    # 6. Stage 3: Pixel hash comparison
     if remaining:
         print("Stage 3: Matching by pixel data (downloading originals)...", file=sys.stderr)
         pcache = load_pixel_cache(args.folder)
@@ -407,7 +481,7 @@ def main():
         print("No matching assets found in Immich.", file=sys.stderr)
         return
 
-    # 6. Set favorites
+    # 7. Set favorites
     asset_ids = [aid for aid, _ in all_matches]
     if args.dry_run:
         print("\nWould favorite these files:", file=sys.stderr)
@@ -418,11 +492,21 @@ def main():
 
     count = set_favorites(args.server, args.api_key, asset_ids, args.dry_run)
 
-    # 7. Summary
+    # 8. Summary and unmatched file handling
     if remaining:
         print(f"\nUnmatched files ({len(remaining)}):", file=sys.stderr)
         for path in remaining:
             print(f"  {path.name}", file=sys.stderr)
+
+        if args.copy_unmatched:
+            if not args.dry_run:
+                import shutil
+                args.copy_unmatched.mkdir(parents=True, exist_ok=True)
+                for path in remaining:
+                    shutil.copy2(path, args.copy_unmatched / path.name)
+                print(f"\nCopied {len(remaining)} unmatched files to {args.copy_unmatched}", file=sys.stderr)
+            else:
+                print(f"\nWould copy {len(remaining)} unmatched files to {args.copy_unmatched}", file=sys.stderr)
 
     print(f"\n{'Would favorite' if args.dry_run else 'Favorited'} {count} assets"
           f" ({len(remaining)} files had no match in Immich)")
