@@ -310,10 +310,13 @@ def match_by_pixel_hash(
     """Stage 3: Match by downloading originals and comparing pixel data.
 
     Uses pcache to avoid re-downloading assets seen in previous runs.
+    Tries timezone offsets to minimize candidate downloads.
     Returns (matches, unmatched_files).
     """
     matches = []
     unmatched = []
+    common_offsets = [0, -1, 1, -2, 2, -3, 3, -4, 4, -5, 5, -6, 6, -7, 7, -8, 8,
+                      -9, 9, -10, 10, -11, 11, -12, 12, 13, 14]
 
     for i, path in enumerate(files, 1):
         dt = exif_datetime(path)
@@ -329,30 +332,39 @@ def match_by_pixel_hash(
             unmatched.append(path)
             continue
 
-        # Search candidates by date (±14h for timezone)
-        after = (dt - timedelta(hours=14)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-        before = (dt + timedelta(hours=14)).strftime("%Y-%m-%dT%H:%M:%S.999Z")
-        result = api_request(server, api_key, "POST", "/search/metadata", {
-            "takenAfter": after,
-            "takenBefore": before,
-        })
-        candidates = result.get("assets", {}).get("items", [])
-
         found = False
-        for candidate in candidates:
-            cache_key = f"{candidate['id']}|{candidate.get('checksum', '')}"
-            if cache_key in pcache:
-                remote_phash = pcache[cache_key]
-            else:
-                original = api_download(
-                    server, api_key, f"/assets/{candidate['id']}/original"
-                )
-                remote_phash = pixel_hash(original)
-                pcache[cache_key] = remote_phash
+        # Try each timezone offset to minimize candidates
+        for offset in common_offsets:
+            dt_offset = dt + timedelta(hours=offset)
+            dt_str = dt_offset.strftime("%Y-%m-%dT%H:%M:%S")
+            result = api_request(server, api_key, "POST", "/search/metadata", {
+                "takenAfter": dt_str + ".000Z",
+                "takenBefore": dt_str + ".999Z",
+            })
+            candidates = result.get("assets", {}).get("items", [])
 
-            if remote_phash == local_phash:
-                matches.append((candidate["id"], path))
-                found = True
+            if not candidates:
+                continue
+
+            # Download and compare pixel hashes for candidates at this offset
+            for candidate in candidates:
+                cache_key = f"{candidate['id']}|{candidate.get('checksum', '')}"
+                if cache_key in pcache:
+                    remote_phash = pcache[cache_key]
+                else:
+                    original = api_download(
+                        server, api_key, f"/assets/{candidate['id']}/original"
+                    )
+                    remote_phash = pixel_hash(original)
+                    if remote_phash:
+                        pcache[cache_key] = remote_phash
+
+                if remote_phash == local_phash:
+                    matches.append((candidate["id"], path))
+                    found = True
+                    break
+
+            if found:
                 break
 
         if not found:
