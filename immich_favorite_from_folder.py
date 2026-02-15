@@ -15,6 +15,7 @@ import io
 import json
 import os
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
@@ -35,18 +36,24 @@ def sha1_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def pixel_hash(path_or_bytes) -> str:
-    """Return SHA-1 of decoded pixel data (ignores JPEG encoding/EXIF)."""
-    if isinstance(path_or_bytes, bytes):
-        img = Image.open(io.BytesIO(path_or_bytes))
-    else:
-        img = Image.open(path_or_bytes)
-    img = img.convert("RGB")
-    return hashlib.sha1(img.tobytes()).hexdigest()
+def pixel_hash(path_or_bytes) -> str | None:
+    """Return SHA-1 of decoded pixel data (ignores JPEG encoding/EXIF).
+
+    Returns None for non-image files (e.g. videos).
+    """
+    try:
+        if isinstance(path_or_bytes, bytes):
+            img = Image.open(io.BytesIO(path_or_bytes))
+        else:
+            img = Image.open(path_or_bytes)
+        img = img.convert("RGB")
+        return hashlib.sha1(img.tobytes()).hexdigest()
+    except Exception:
+        return None
 
 
-def exif_datetime(path: Path) -> str | None:
-    """Extract EXIF DateTimeOriginal as ISO 8601 string, or None."""
+def exif_datetime(path: Path) -> datetime | None:
+    """Extract EXIF DateTimeOriginal as a datetime object, or None."""
     try:
         img = Image.open(path)
         exif = img.getexif()
@@ -56,8 +63,7 @@ def exif_datetime(path: Path) -> str | None:
             dt = exif.get(306)  # DateTime fallback
         if not dt:
             return None
-        # "YYYY:MM:DD HH:MM:SS" -> "YYYY-MM-DDTHH:MM:SS"
-        return dt.replace(":", "-", 2).replace(" ", "T")
+        return datetime.strptime(dt, "%Y:%m:%d %H:%M:%S")
     except Exception:
         return None
 
@@ -201,10 +207,12 @@ def match_by_exif(
             unmatched.append(path)
             continue
 
-        # Search within a 1-second window
+        # Search ±14h to handle timezone differences (EXIF has no tz info)
+        after = (dt - timedelta(hours=14)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        before = (dt + timedelta(hours=14)).strftime("%Y-%m-%dT%H:%M:%S.999Z")
         result = api_request(server, api_key, "POST", "/search/metadata", {
-            "takenAfter": dt + ".000Z",
-            "takenBefore": dt + ".999Z",
+            "takenAfter": after,
+            "takenBefore": before,
         })
         candidates = result.get("assets", {}).get("items", [])
 
@@ -212,13 +220,16 @@ def match_by_exif(
             unmatched.append(path)
             continue
 
-        # Filter by dimensions if we have them
-        if dims and len(candidates) > 1:
+        # Filter by dimensions (keep candidates with unknown dims)
+        if dims:
             w, h = dims
-            candidates = [
+            filtered = [
                 c for c in candidates
-                if c.get("width") == w and c.get("height") == h
+                if (c.get("width") is None or c.get("height") is None)
+                or (c.get("width") == w and c.get("height") == h)
             ]
+            if filtered:
+                candidates = filtered
 
         if len(candidates) == 1:
             matches.append((candidates[0]["id"], path))
@@ -253,11 +264,16 @@ def match_by_pixel_hash(
             continue
 
         local_phash = pixel_hash(path)
+        if not local_phash:
+            unmatched.append(path)
+            continue
 
-        # Search candidates by date
+        # Search candidates by date (±14h for timezone)
+        after = (dt - timedelta(hours=14)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        before = (dt + timedelta(hours=14)).strftime("%Y-%m-%dT%H:%M:%S.999Z")
         result = api_request(server, api_key, "POST", "/search/metadata", {
-            "takenAfter": dt + ".000Z",
-            "takenBefore": dt + ".999Z",
+            "takenAfter": after,
+            "takenBefore": before,
         })
         candidates = result.get("assets", {}).get("items", [])
 
