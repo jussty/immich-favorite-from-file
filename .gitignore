@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.sha1cache.json
+*.jpg
+*.jpeg
+*.png
+*.mp4
+*.mov
+*.heic
+.env
