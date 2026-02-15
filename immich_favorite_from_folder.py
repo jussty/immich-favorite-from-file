@@ -441,6 +441,7 @@ def main():
     print("Computing SHA-1 checksums...", file=sys.stderr)
     cache = load_cache(args.folder)
     file_checksums: dict[str, Path] = {}
+    duplicates: list[tuple[Path, Path]] = []  # (duplicate_file, original_file)
     cache_hits = 0
     new_cache: dict[str, str] = {}
     for i, path in enumerate(files, 1):
@@ -451,10 +452,22 @@ def main():
         else:
             sha1 = sha1_file(path)
         new_cache[key] = sha1
-        file_checksums[sha1] = path
+
+        # Detect duplicates: keep first occurrence
+        if sha1 in file_checksums:
+            duplicates.append((path, file_checksums[sha1]))
+        else:
+            file_checksums[sha1] = path
+
         if i % 100 == 0 or i == len(files):
             print(f"  Hashed {i}/{len(files)} ({cache_hits} cached)...", file=sys.stderr)
     save_cache(args.folder, new_cache)
+
+    if duplicates:
+        print(f"\nWarning: Found {len(duplicates)} duplicate files (same content):", file=sys.stderr)
+        for dup, original in duplicates:
+            print(f"  {dup.name} (duplicate of {original.name})", file=sys.stderr)
+        print(f"  → Only processing {len(file_checksums)} unique files\n", file=sys.stderr)
 
     all_matches: list[tuple[str, Path]] = []
 
