@@ -541,14 +541,11 @@ def main():
             print(f"  {path.name}", file=sys.stderr)
 
         if args.copy_unmatched:
-            if not args.dry_run:
-                import shutil
-                args.copy_unmatched.mkdir(parents=True, exist_ok=True)
-                for path in remaining:
-                    shutil.copy2(path, args.copy_unmatched / path.name)
-                print(f"\nCopied {len(remaining)} unmatched files to {args.copy_unmatched}", file=sys.stderr)
-            else:
-                print(f"\nWould copy {len(remaining)} unmatched files to {args.copy_unmatched}", file=sys.stderr)
+            import shutil
+            args.copy_unmatched.mkdir(parents=True, exist_ok=True)
+            for path in remaining:
+                shutil.copy2(path, args.copy_unmatched / path.name)
+            print(f"\nCopied {len(remaining)} unmatched files to {args.copy_unmatched}", file=sys.stderr)
 
     print(f"\n{'Would favorite' if args.dry_run else 'Favorited'} {count} assets"
           f" ({len(remaining)} files had no match in Immich)")
