@@ -15,6 +15,7 @@ import io
 import json
 import os
 import sys
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.request import Request, urlopen
@@ -22,7 +23,7 @@ from urllib.error import HTTPError, URLError
 
 from PIL import Image
 
-BATCH_SIZE = 1000
+BATCH_SIZE = 100
 CACHE_FILE = ".sha1cache.json"
 PIXEL_CACHE_FILE = ".pixelcache.json"
 ASSET_CACHE_DIR = ".cache"
@@ -118,35 +119,65 @@ def save_pixel_cache(folder: Path, cache: dict[str, str]) -> None:
     cache_path.write_text(json.dumps(cache))
 
 
+MAX_RETRIES = 5
+RETRY_BACKOFF = 2  # seconds, doubled each retry
+
+
+def _retry(func, description: str):
+    """Retry a function with exponential backoff."""
+    for attempt in range(MAX_RETRIES):
+        try:
+            return func()
+        except HTTPError as e:
+            body_text = e.read().decode(errors="replace")
+            if e.code < 500 and e.code != 429:
+                # Client error (not rate-limited) — don't retry
+                print(f"API error {e.code} on {description}: {body_text}", file=sys.stderr)
+                sys.exit(1)
+            wait = RETRY_BACKOFF * (2 ** attempt)
+            print(f"  Retry {attempt + 1}/{MAX_RETRIES} after {e.code} on {description} "
+                  f"(waiting {wait}s)...", file=sys.stderr)
+            time.sleep(wait)
+        except (URLError, OSError) as e:
+            wait = RETRY_BACKOFF * (2 ** attempt)
+            reason = getattr(e, "reason", e)
+            print(f"  Retry {attempt + 1}/{MAX_RETRIES} after connection error on {description}: "
+                  f"{reason} (waiting {wait}s)...", file=sys.stderr)
+            time.sleep(wait)
+
+    print(f"Failed after {MAX_RETRIES} retries on {description}", file=sys.stderr)
+    sys.exit(1)
+
+
 def api_request(server: str, api_key: str, method: str, endpoint: str, body=None):
     """Make an Immich API request and return parsed JSON (or None for 204)."""
     url = f"{server.rstrip('/')}/api{endpoint}"
     data = json.dumps(body).encode() if body else None
-    req = Request(url, data=data, method=method)
-    req.add_header("x-api-key", api_key)
-    req.add_header("Content-Type", "application/json")
-    req.add_header("Accept", "application/json")
-    try:
+
+    def _do():
+        req = Request(url, data=data, method=method)
+        req.add_header("x-api-key", api_key)
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Accept", "application/json")
         with urlopen(req) as resp:
             if resp.status == 204:
                 return None
             return json.loads(resp.read())
-    except HTTPError as e:
-        body_text = e.read().decode(errors="replace")
-        print(f"API error {e.code} on {method} {endpoint}: {body_text}", file=sys.stderr)
-        sys.exit(1)
-    except URLError as e:
-        print(f"Connection error: {e.reason}", file=sys.stderr)
-        sys.exit(1)
+
+    return _retry(_do, f"{method} {endpoint}")
 
 
 def api_download(server: str, api_key: str, endpoint: str) -> bytes:
     """Download binary data from Immich API."""
     url = f"{server.rstrip('/')}/api{endpoint}"
-    req = Request(url)
-    req.add_header("x-api-key", api_key)
-    with urlopen(req) as resp:
-        return resp.read()
+
+    def _do():
+        req = Request(url)
+        req.add_header("x-api-key", api_key)
+        with urlopen(req) as resp:
+            return resp.read()
+
+    return _retry(_do, f"GET {endpoint}")
 
 
 def scan_folder(folder: Path) -> list[Path]:
@@ -523,14 +554,26 @@ def main():
         print("No matching assets found in Immich.", file=sys.stderr)
         return
 
-    # 7. Set favorites
-    asset_ids = [aid for aid, _ in all_matches]
+    # 7. Deduplicate by asset ID (multiple local files can match the same asset)
+    seen_ids: dict[str, Path] = {}
+    duplicate_matches = 0
+    for asset_id, path in all_matches:
+        if asset_id in seen_ids:
+            duplicate_matches += 1
+        else:
+            seen_ids[asset_id] = path
+
+    if duplicate_matches:
+        print(f"\nNote: {duplicate_matches} local files matched assets already matched by other files",
+              file=sys.stderr)
+
+    asset_ids = list(seen_ids.keys())
     if args.dry_run:
         print("\nWould favorite these files:", file=sys.stderr)
-        for asset_id, path in all_matches:
+        for asset_id, path in seen_ids.items():
             print(f"  {path.name} -> {asset_id}", file=sys.stderr)
     else:
-        print("Setting favorites...", file=sys.stderr)
+        print(f"Setting {len(asset_ids)} unique favorites...", file=sys.stderr)
 
     count = set_favorites(args.server, args.api_key, asset_ids, args.dry_run)
 
